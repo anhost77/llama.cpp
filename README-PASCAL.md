@@ -16,6 +16,7 @@ Base: upstream `aa75ff3` (2026-11-10).
 2. A Pascal-only MMVQ path (`ggml/src/ggml-cuda/mmvq.cu`): one warp per block, several rows per block, also used for 2-4 columns (speculative / MTP verification), plus reuse of the q8_1-quantized activations between consecutive MUL_MAT.
 3. MTP draft head restricted to a token list: the draft output head (248k tokens on Qwen3.6) only computes the token ids listed in a file. The main model still verifies every draft over the full vocabulary, so the generated text is unchanged; only drafts outside the list are lost. A French list built from public-domain novels (Project Gutenberg) is provided in [pascal/tokens-fr.txt](pascal/tokens-fr.txt) (18k ids). Lists that are too short (8k) are slower.
 4. `GGML_CUDA_PROFILE=1`: time per node type, printed at exit.
+5. Small-kernel fusions in the gated delta net (Qwen3.5/3.6 linear-attention layers): one L2 norm for q and k (`LLAMA_PASCAL_GDN_QK_NORM`, bit-identical) and the alpha/beta gates in one kernel (`GGML_CUDA_PASCAL_FUSE_GDN_GATES`). 1186 -> 1036 nodes per token, about +2% generation, perplexity unchanged. `GGML_CUDA_PASCAL_DUMP_GRAPH=N` dumps the ordered node list.
 
 Runtime switches:
 
@@ -62,7 +63,9 @@ Same-session averages over 3-4 runs (second session, 2026-11-11). The token-list
 
 Most of the batch-1 gain comes from the three backported PRs; the multi-column kernel mainly helps MTP on long contexts, the token list cuts about 3 ms per MTP step. `--spec-draft-n-max 1` or `3` and `--spec-draft-p-min` were slower. Profiling shows about 40% of single-token time in small kernels (RMS_NORM, GET_ROWS, small F32 MUL_MAT), while the large quantized matmuls already run near the P40 bandwidth limit: kernel fusion is the next step.
 
-Full tables: [pascal/results-kernels.md](pascal/results-kernels.md), [pascal/results-server.md](pascal/results-server.md), [pascal/results-04.md](pascal/results-04.md); benchmark scripts: [pascal/bench.sh](pascal/bench.sh), [pascal/session04.sh](pascal/session04.sh).
+On a real fact-checking workload (8 requests: instructions + source excerpts + one sentence to check, ~270 generated tokens each), this branch with fusions + token list + MTP n-max 2 reaches 101 t/s vs 67.5 t/s without speculative decoding (same build, same session); MTP acceptance is 79% there. n-gram prompt lookup (`ngram-simple`, `ngram-mod`, `ngram-map-k`, alone or combined with MTP) was always slower on this workload (65-97 t/s), and n-max 3/4 gave no significant gain. Each removed small kernel saves about 2 us.
+
+Full tables: [pascal/results-05.md](pascal/results-05.md), [pascal/results-05-verification.md](pascal/results-05-verification.md), [pascal/results-kernels.md](pascal/results-kernels.md), [pascal/results-server.md](pascal/results-server.md), [pascal/results-04.md](pascal/results-04.md); benchmark scripts: [pascal/bench.sh](pascal/bench.sh), [pascal/session04.sh](pascal/session04.sh).
 
 ## How this was made
 
