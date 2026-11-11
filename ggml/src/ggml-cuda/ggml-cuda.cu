@@ -878,6 +878,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (q8_1_cache.buf != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(q8_1_cache.buf));
+        q8_1_cache.buf = nullptr;
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -5115,6 +5120,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            cuda_ctx->q8_1_cache.valid = false; // [pascal fork]
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
 #ifdef USE_CUDA_GRAPH
@@ -5166,9 +5173,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // [pascal fork] a node that writes into an existing tensor may change data that was quantized earlier
+                if (node->view_src != nullptr) {
+                    cuda_ctx->q8_1_cache.valid = false;
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    // [pascal fork] same check for the nodes that were executed as part of the fused kernel
+                    for (int k = i; k <= i + nodes_to_skip && k < cgraph->n_nodes; ++k) {
+                        const ggml_tensor * fused_node = cgraph->nodes[k];
+                        if (fused_node->view_src != nullptr && !ggml_cuda_is_view_or_noop(fused_node)) {
+                            cuda_ctx->q8_1_cache.valid = false;
+                        }
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -5260,6 +5279,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // [pascal fork] tensors are recomputed by every graph evaluation
+    cuda_ctx->q8_1_cache.valid = false;
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

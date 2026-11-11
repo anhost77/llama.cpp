@@ -1286,6 +1286,18 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // [pascal fork] the q8_1 activations last quantized for MMVQ, reused by consecutive MUL_MAT(_ID) nodes that read the same tensor.
+    // The buffer has a fixed size and is never reallocated, since captured CUDA graphs keep its address.
+    // See ggml_cuda_mul_mat_vec_q; disable with GGML_CUDA_PASCAL_Q8_CACHE=0.
+    struct q8_1_cache_state {
+        void *       buf   = nullptr;
+        bool         valid = false;
+        const void * root  = nullptr; // the tensor that owns the data (view_src of views)
+        const void * data  = nullptr;
+        int64_t      ne10  = 0;
+        int64_t      ncols = 0;
+    } q8_1_cache;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
