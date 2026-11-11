@@ -1,5 +1,5 @@
 > [!NOTE]
-> **Pascal fork (Tesla P40 / sm_61).** This branch adds Pascal-specific CUDA optimizations on top of upstream llama.cpp: about +8% generation, +14% prompt processing, and up to 106 t/s on a real fact-checking workload with MTP and a draft token list on a P40 (Qwen3.6-35B-A3B Q4_0). Experimental, AI-written, not affiliated with ggml-org. See [README-PASCAL.md](README-PASCAL.md). Upstream project: [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
+> **Pascal fork (Tesla P40 / sm_61).** This branch adds Pascal-specific CUDA optimizations on top of upstream llama.cpp. On a P40 with Qwen3.6-35B-A3B Q4_0: about +19% single-token generation (63.7 -> 75.8 t/s, llama-bench tg128), +14% prompt processing, and 106 t/s on a real fact-checking workload with MTP and a draft token list (67.6 t/s without speculative decoding). Experimental, AI-written, not affiliated with ggml-org. See [README-PASCAL.md](README-PASCAL.md). Upstream project: [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
 
 # llama.cpp
 
