@@ -4291,6 +4291,277 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
 // try and fuse nodes and return the number of nodes to skip
 // ---------------------------------------------------------------------------------------------------------
+// [pascal fork] Gated delta net: read the recurrent state straight from the cache.
+// build_rs gathers the state of the sequence with GET_ROWS (2 MB per layer for qwen35moe) before the gated delta net
+// reads it once. For a single sequence the kernel can index the cache itself: the GET_ROWS node is not executed and
+// the GATED_DELTA_NET node gets the cache and the device pointer of the row index.
+// Only when every use of the gathered tensor is a view, an empty node, or the state input of that GATED_DELTA_NET.
+// GGML_CUDA_PASCAL_GDN_DIRECT_STATE=0 disables it.
+
+static bool ggml_cuda_pascal_gdn_direct_state_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_PASCAL_GDN_DIRECT_STATE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_pascal_gdn_state_elide(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * rows = cgraph->nodes[i];
+    if (rows->op != GGML_OP_GET_ROWS || !ggml_cuda_pascal_gdn_direct_state_enabled()) {
+        return false;
+    }
+    const ggml_tensor * cache = rows->src[0];
+    const ggml_tensor * ids   = rows->src[1];
+    if (cache == nullptr || ids == nullptr || cache->type != GGML_TYPE_F32 || rows->type != GGML_TYPE_F32 ||
+            ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 || !ggml_is_contiguous(cache) || !ggml_is_contiguous(ids) ||
+            cache->ne[2] != 1 || cache->ne[3] != 1 || rows->ne[0] != cache->ne[0] || ggml_nelements(rows) != cache->ne[0] ||
+            rows->ne[0] < 4096) {
+        return false;
+    }
+
+    // the tensors that alias the gathered state: the node and its non-empty views
+    constexpr int max_alias  = 8;
+    constexpr int max_window = 64;
+    int alias_idx[max_alias];
+    int alias_uses[max_alias];
+    int n_alias = 0;
+    alias_idx[n_alias]  = i;
+    alias_uses[n_alias] = 0;
+    n_alias++;
+
+    const ggml_tensor * gdn = nullptr;
+    const int end = i + 1 + max_window < cgraph->n_nodes ? i + 1 + max_window : cgraph->n_nodes;
+    for (int k = i + 1; k < end; ++k) {
+        const ggml_tensor * node = cgraph->nodes[k];
+        bool uses_alias = false;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (node->src[s] == nullptr) {
+                continue;
+            }
+            for (int a = 0; a < n_alias; ++a) {
+                if (node->src[s] != cgraph->nodes[alias_idx[a]]) {
+                    continue;
+                }
+                alias_uses[a]++;
+                uses_alias = true;
+                if (node->op == GGML_OP_GATED_DELTA_NET) {
+                    // only as the state input, and only once
+                    if (s != 5 || gdn != nullptr) {
+                        return false;
+                    }
+                    gdn = node;
+                }
+            }
+        }
+        if (!uses_alias || node->op == GGML_OP_GATED_DELTA_NET || ggml_is_empty(node)) {
+            continue;
+        }
+        if ((node->op != GGML_OP_VIEW && node->op != GGML_OP_RESHAPE) || n_alias >= max_alias) {
+            return false; // a real consumer of the gathered copy
+        }
+        alias_idx[n_alias]  = k;
+        alias_uses[n_alias] = 0;
+        n_alias++;
+    }
+    if (gdn == nullptr) {
+        return false;
+    }
+    // no use outside of the window
+    for (int a = 0; a < n_alias; ++a) {
+        if (alias_uses[a] != ggml_node_get_use_count(cgraph, alias_idx[a])) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * state = gdn->src[5];
+    const ggml_tensor * v     = gdn->src[2];
+    if (state == nullptr || v == nullptr || state->data != rows->data || state->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+    const int     K        = ggml_get_op_params_i32(gdn, 0);
+    // a single sequence, a few tokens (the chunked kernel for long batches keeps the gathered copy)
+    if (n_seqs != 1 || n_tokens > K || S_v * S_v * H != rows->ne[0] || ggml_nelements(state) != rows->ne[0]) {
+        return false;
+    }
+
+    ggml_backend_cuda_context::gdn_state_src src;
+    src.cache      = (const float *) cache->data;
+    src.ids        = (const int32_t *) ids->data;
+    src.row_stride = (int64_t) (cache->nb[1] / sizeof(float));
+    cuda_ctx->gdn_state_srcs[gdn] = src;
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// [pascal fork] End of the MoE block for a few tokens, in one kernel instead of three:
+//     out = moe_out + shexp * sigmoid(w_gate . x) + residual
+// Matches MUL_MAT (F32 weight with a single row), UNARY(sigmoid), MUL, ADD, ADD.
+// GGML_CUDA_PASCAL_FUSE_SHEXP_GATE=0 disables it.
+
+static bool ggml_cuda_pascal_shexp_gate_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_PASCAL_FUSE_SHEXP_GATE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Grid: one block of 256 threads per token. The dot product is finished by the whole block before any thread writes,
+// and every thread only writes the elements it has read, so dst may be any of the inputs (in place).
+static __global__ void ggml_cuda_pascal_shexp_gate_kernel(
+        const float * w, const float * x_all, const float * shexp_all, const float * moe_all, const float * resid_all,
+        float * dst_all, const int n_embd) {
+    const int64_t offset = (int64_t) blockIdx.x * n_embd;
+    const float * x     = x_all     + offset;
+    const float * shexp = shexp_all + offset;
+    const float * moe   = moe_all   + offset;
+    const float * resid = resid_all + offset;
+    float *       dst   = dst_all   + offset;
+
+    __shared__ float partial[8];
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n_embd; i += 256) {
+        sum += w[i] * x[i];
+    }
+    sum = warp_reduce_sum<32>(sum);
+    if ((threadIdx.x & 31) == 0) {
+        partial[threadIdx.x >> 5] = sum;
+    }
+    __syncthreads();
+
+    float total = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        total += partial[j];
+    }
+    const float gate = 1.0f / (1.0f + expf(-total));
+
+    for (int i = threadIdx.x; i < n_embd; i += 256) {
+        const float value = (moe[i] + shexp[i] * gate) + resid[i];
+        dst[i] = value;
+    }
+}
+
+static const int GGML_CUDA_PASCAL_SHEXP_GATE_NODES = 5;
+
+struct ggml_cuda_pascal_shexp_gate_match {
+    const ggml_tensor * w     = nullptr;
+    const ggml_tensor * x     = nullptr;
+    const ggml_tensor * shexp = nullptr;
+    const ggml_tensor * moe   = nullptr;
+    const ggml_tensor * resid = nullptr;
+    const ggml_tensor * dst   = nullptr;
+};
+
+static bool ggml_cuda_pascal_match_shexp_gate(const ggml_cgraph * cgraph, const int i, ggml_cuda_pascal_shexp_gate_match & match) {
+    static const enum ggml_op ops[GGML_CUDA_PASCAL_SHEXP_GATE_NODES] = {
+        GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD,
+    };
+    if (i + GGML_CUDA_PASCAL_SHEXP_GATE_NODES > cgraph->n_nodes) {
+        return false;
+    }
+    for (int k = 0; k < GGML_CUDA_PASCAL_SHEXP_GATE_NODES; ++k) {
+        if (cgraph->nodes[i + k]->op != ops[k] || cgraph->nodes[i + k]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const ggml_tensor * mm   = cgraph->nodes[i + 0];
+    const ggml_tensor * sg   = cgraph->nodes[i + 1];
+    const ggml_tensor * mul  = cgraph->nodes[i + 2];
+    const ggml_tensor * add1 = cgraph->nodes[i + 3];
+    const ggml_tensor * add2 = cgraph->nodes[i + 4];
+
+    if (sg->src[0] != mm || ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    const ggml_tensor * shexp = mul->src[1]  == sg   ? mul->src[0]  : (mul->src[0]  == sg   ? mul->src[1]  : nullptr);
+    const ggml_tensor * moe   = add1->src[1] == mul  ? add1->src[0] : (add1->src[0] == mul  ? add1->src[1] : nullptr);
+    const ggml_tensor * resid = add2->src[1] == add1 ? add2->src[0] : (add2->src[0] == add1 ? add2->src[1] : nullptr);
+    const ggml_tensor * w     = mm->src[0];
+    const ggml_tensor * x     = mm->src[1];
+    if (shexp == nullptr || moe == nullptr || resid == nullptr || w == nullptr || x == nullptr) {
+        return false;
+    }
+
+    const int64_t n_embd = w->ne[0];
+    if (w->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || shexp->type != GGML_TYPE_F32 ||
+            moe->type != GGML_TYPE_F32 || resid->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (ggml_nelements(w) != n_embd || n_embd < 256 || n_embd > INT32_MAX || x->ne[0] != n_embd || ggml_nelements(x) % n_embd != 0) {
+        return false;
+    }
+    const int64_t n_tokens = ggml_nelements(x) / n_embd;
+    if (n_tokens < 1 || n_tokens > 64 || ggml_nelements(mm) != n_tokens || ggml_nelements(sg) != n_tokens) {
+        return false;
+    }
+    const ggml_tensor * full[] = { x, shexp, moe, resid, mul, add1, add2 };
+    for (const ggml_tensor * t : full) {
+        if (!ggml_is_contiguous(t) || t->ne[0] != n_embd || ggml_nelements(t) != n_embd * n_tokens) {
+            return false;
+        }
+    }
+    if (!ggml_is_contiguous(w)) {
+        return false;
+    }
+
+    const int outputs[1] = { i + 4 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, GGML_CUDA_PASCAL_SHEXP_GATE_NODES, ops, outputs, 1)) {
+        return false;
+    }
+
+    // dst may be exactly one of the inputs (in place), but not a shifted overlap, and never the weight
+    const char * dst_begin = (const char *) add2->data;
+    const char * dst_end   = dst_begin + ggml_nbytes(add2);
+    const ggml_tensor * inputs[] = { x, shexp, moe, resid };
+    for (const ggml_tensor * t : inputs) {
+        const char * t_begin = (const char *) t->data;
+        const char * t_end   = t_begin + ggml_nbytes(t);
+        if (t_begin != dst_begin && t_begin < dst_end && dst_begin < t_end) {
+            return false;
+        }
+    }
+    {
+        const char * w_begin = (const char *) w->data;
+        const char * w_end   = w_begin + ggml_nbytes(w);
+        if (w_begin < dst_end && dst_begin < w_end) {
+            return false;
+        }
+    }
+
+    match.w     = w;
+    match.x     = x;
+    match.shexp = shexp;
+    match.moe   = moe;
+    match.resid = resid;
+    match.dst   = add2;
+    return true;
+}
+
+static void ggml_cuda_pascal_shexp_gate(ggml_backend_cuda_context & ctx, const ggml_cuda_pascal_shexp_gate_match & match) {
+    const float * w_d     = (const float *) match.w->data;
+    const float * x_d     = (const float *) match.x->data;
+    const float * shexp_d = (const float *) match.shexp->data;
+    const float * moe_d   = (const float *) match.moe->data;
+    const float * resid_d = (const float *) match.resid->data;
+    float *       dst_d   = (float *) match.dst->data;
+    const int     n_embd  = (int) match.w->ne[0];
+    const int     n_tokens = (int) (ggml_nelements(match.x) / n_embd);
+
+    const dim3 block_nums(n_tokens, 1, 1);
+    const dim3 block_dims(256, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, ctx.stream());
+    ggml_cuda_kernel_launch(ggml_cuda_pascal_shexp_gate_kernel, launch_params,
+        w_d, x_d, shexp_d, moe_d, resid_d, dst_d, n_embd);
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // [pascal fork] Gates of the gated delta net for a few tokens (generation, speculative verification), in one kernel instead of five:
 //     g    = softplus(W_alpha * x + dt) * a
 //     beta = sigmoid(W_beta * x)
@@ -4500,6 +4771,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // [pascal fork] end of the MoE block: gate of the shared expert and the two additions
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_pascal_shexp_gate_enabled() &&
+            cuda_ctx->stream_context().concurrent_events.empty()) {
+        ggml_cuda_pascal_shexp_gate_match match;
+        if (ggml_cuda_pascal_match_shexp_gate(cgraph, i, match)) {
+            ggml_cuda_pascal_shexp_gate(*cuda_ctx, match);
+            return GGML_CUDA_PASCAL_SHEXP_GATE_NODES - 1;
+        }
+    }
 
     // [pascal fork] gates of the gated delta net
     if (node->op == GGML_OP_MUL_MAT && ggml_cuda_pascal_gdn_gates_enabled() &&
@@ -5396,6 +5677,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             cuda_ctx->q8_1_cache.valid = false; // [pascal fork]
+            cuda_ctx->gdn_state_srcs.clear();   // [pascal fork]
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -5451,6 +5733,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // [pascal fork] a node that writes into an existing tensor may change data that was quantized earlier
                 if (node->view_src != nullptr) {
                     cuda_ctx->q8_1_cache.valid = false;
+                }
+
+                // [pascal fork] the gated delta net reads this state from the cache itself
+                if (node->op == GGML_OP_GET_ROWS && !is_concurrent_event_active && stream_ctx.concurrent_events.empty() &&
+                        ggml_cuda_pascal_gdn_state_elide(cuda_ctx, cgraph, i)) {
+                    continue;
                 }
 
                 // [pascal fork] GGML_CUDA_PROFILE

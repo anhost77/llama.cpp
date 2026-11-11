@@ -1286,6 +1286,15 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // [pascal fork] gated delta net nodes that read their state straight from the recurrent cache, because the GET_ROWS
+    // node that gathers it was elided (see ggml_cuda_pascal_gdn_state_elide). Rebuilt by every graph evaluation.
+    struct gdn_state_src {
+        const float *   cache      = nullptr; // first cell of the cache
+        const int32_t * ids        = nullptr; // on the device: the cell to read, one per sequence
+        int64_t         row_stride = 0;       // in floats
+    };
+    std::unordered_map<const ggml_tensor *, gdn_state_src> gdn_state_srcs;
+
     // [pascal fork] the q8_1 activations last quantized for MMVQ, reused by consecutive MUL_MAT(_ID) nodes that read the same tensor.
     // The buffer has a fixed size and is never reallocated, since captured CUDA graphs keep its address.
     // See ggml_cuda_mul_mat_vec_q; disable with GGML_CUDA_PASCAL_Q8_CACHE=0.
