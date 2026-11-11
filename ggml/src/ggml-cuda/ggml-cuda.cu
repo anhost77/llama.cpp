@@ -155,6 +155,71 @@ static bool ggml_cuda_env_set(const char * name) {
     return getenv(name) != nullptr;
 }
 
+// [pascal fork] GGML_CUDA_PROFILE=1: wall clock time per kind of node, printed when the process exits.
+// The stream is synchronized around every node, so this is a diagnostic mode (CUDA graphs are not used for the measure).
+#include <algorithm>
+#include <cstdio>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
+static bool ggml_cuda_profile_enabled() {
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_PROFILE");
+    return enabled;
+}
+
+struct ggml_cuda_profile_entry {
+    int64_t t_us  = 0;
+    int64_t count = 0;
+};
+
+static std::map<std::string, ggml_cuda_profile_entry> & ggml_cuda_profile_data() {
+    // never destroyed: it is read by an atexit handler that is registered before its construction
+    static std::map<std::string, ggml_cuda_profile_entry> * data = new std::map<std::string, ggml_cuda_profile_entry>();
+    return *data;
+}
+
+static int64_t g_ggml_cuda_profile_graphs = 0;
+
+static void ggml_cuda_profile_print() {
+    std::vector<std::pair<std::string, ggml_cuda_profile_entry>> rows(ggml_cuda_profile_data().begin(), ggml_cuda_profile_data().end());
+    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second.t_us > b.second.t_us; });
+    int64_t total = 0;
+    for (const auto & row : rows) {
+        total += row.second.t_us;
+    }
+    fprintf(stderr, "\n[ggml-cuda profile] %lld graphs, %.1f ms in nodes\n", (long long) g_ggml_cuda_profile_graphs, total / 1000.0);
+    fprintf(stderr, "[ggml-cuda profile] %10s %6s %9s %9s  %s\n", "ms", "%", "count", "us/call", "node");
+    for (const auto & row : rows) {
+        fprintf(stderr, "[ggml-cuda profile] %10.2f %6.2f %9lld %9.1f  %s\n",
+                row.second.t_us / 1000.0, total > 0 ? 100.0 * row.second.t_us / total : 0.0, (long long) row.second.count,
+                row.second.count > 0 ? (double) row.second.t_us / row.second.count : 0.0, row.first.c_str());
+    }
+}
+
+static void ggml_cuda_profile_add(const ggml_tensor * node, const int n_fused, const int64_t t_us) {
+    static const bool registered = [] {
+        atexit(ggml_cuda_profile_print);
+        return true;
+    }();
+    GGML_UNUSED(registered);
+
+    char key[256];
+    const ggml_tensor * src0 = node->src[0];
+    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && src0 != nullptr && node->src[1] != nullptr) {
+        const ggml_tensor * src1 = node->src[1];
+        snprintf(key, sizeof(key), "%s %s %lldx%lldx%lld cols=%lldx%lld%s", ggml_op_name(node->op), ggml_type_name(src0->type),
+                (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2],
+                (long long) src1->ne[1], (long long) src1->ne[2], n_fused > 0 ? " +fused" : "");
+    } else {
+        snprintf(key, sizeof(key), "%s%s", ggml_op_name(node->op), n_fused > 0 ? " +fused" : "");
+    }
+    ggml_cuda_profile_entry & entry = ggml_cuda_profile_data()[key];
+    entry.t_us  += t_us;
+    entry.count += 1;
+}
+
 static bool ggml_cuda_unified_memory_enabled() {
     static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_ENABLE_UNIFIED_MEMORY");
     return enabled;
@@ -5178,9 +5243,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     cuda_ctx->q8_1_cache.valid = false;
                 }
 
+                // [pascal fork] GGML_CUDA_PROFILE
+                const bool profile_node = ggml_cuda_profile_enabled() && !use_cuda_graph && !is_concurrent_event_active;
+                int64_t    profile_t0   = 0;
+                if (profile_node) {
+                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    profile_t0 = ggml_time_us();
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    if (profile_node) {
+                        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                        ggml_cuda_profile_add(node, nodes_to_skip, ggml_time_us() - profile_t0);
+                    }
                     // [pascal fork] same check for the nodes that were executed as part of the fused kernel
                     for (int k = i; k <= i + nodes_to_skip && k < cgraph->n_nodes; ++k) {
                         const ggml_tensor * fused_node = cgraph->nodes[k];
@@ -5219,6 +5296,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (profile_node) {
+                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    ggml_cuda_profile_add(node, 0, ggml_time_us() - profile_t0);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -5282,6 +5364,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     // [pascal fork] tensors are recomputed by every graph evaluation
     cuda_ctx->q8_1_cache.valid = false;
+
+    if (ggml_cuda_profile_enabled()) {
+        g_ggml_cuda_profile_graphs++;
+    }
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

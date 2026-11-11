@@ -3,9 +3,14 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <type_traits>
+#include <vector>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
@@ -1050,16 +1055,16 @@ static __global__ void mul_mat_vec_q_moe(
 // The generic kernel spends 2 to 4 warps and a shared memory reduction on each row, for the short rows of small hidden sizes
 // (K = 512 ... 4096) the per-block overhead then dominates on Pascal.
 // Only for a single sample (ne3 == 1) and nrows_x % c_rows == 0, the host falls back to the generic kernel otherwise.
-// Runtime switches: GGML_CUDA_PASCAL_MMVQ_ROWS (0 = off, 1/2/4 = rows per block, unset = auto), GGML_CUDA_PASCAL_MMVQ_MULTI (0/1).
+// Runtime switches: GGML_CUDA_PASCAL_MMVQ_ROWS (0 = off, 1/2/4 = rows per block, -1 = by K, unset = 2), GGML_CUDA_PASCAL_MMVQ_MULTI (0/1).
 
 static int ggml_cuda_pascal_mmvq_rows_env() {
     static const int rows = [] {
         const char * env = getenv("GGML_CUDA_PASCAL_MMVQ_ROWS");
         if (env == nullptr) {
-            return -1; // auto
+            return 2; // measured on a P40: 2 rows beat 1, 4 and the K-dependent choice (-1) for Q4_0 and Q4_K
         }
         const int v = atoi(env);
-        return v == 1 || v == 2 || v == 4 ? v : 0;
+        return v == -1 || v == 1 || v == 2 || v == 4 ? v : 0;
     }();
     return rows;
 }
@@ -1780,6 +1785,220 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// [pascal fork] Output head of the MTP draft restricted to a list of tokens.
+// A draft step reads the whole output matrix (n_vocab rows) for a single token, which is the most expensive part of the
+// MTP head. GGML_CUDA_PASCAL_HEAD_TOKENS=<file> names a text file with token ids (most frequent first, whitespace
+// separated), GGML_CUDA_PASCAL_HEAD_N=<n> keeps the first n of them (default: all). The MUL_MAT whose weight is named
+// GGML_CUDA_PASCAL_HEAD_NAME (set by the MTP graph only) then computes the logits of these tokens and writes -inf for all
+// the others. A draft token outside of the list is rejected by the target model: the generated text never changes.
+
+#define GGML_CUDA_PASCAL_HEAD_NAME "pascal.mtp_head"
+
+struct ggml_cuda_pascal_rowlist {
+    bool      loaded  = false;
+    int32_t * rows    = nullptr; // on the device, n entries, n is even
+    int       n       = 0;
+    int64_t   n_vocab = 0;
+};
+
+static const ggml_cuda_pascal_rowlist * ggml_cuda_pascal_rowlist_get(const int device, const int64_t n_vocab) {
+    static std::mutex mutex;
+    static ggml_cuda_pascal_rowlist lists[GGML_CUDA_MAX_DEVICES];
+
+    std::lock_guard<std::mutex> lock(mutex);
+    ggml_cuda_pascal_rowlist & list = lists[device];
+
+    if (!list.loaded) {
+        list.loaded  = true;
+        list.n_vocab = n_vocab;
+
+        const char * path = getenv("GGML_CUDA_PASCAL_HEAD_TOKENS");
+        if (path == nullptr || path[0] == '\0') {
+            return nullptr;
+        }
+        const char * env_n = getenv("GGML_CUDA_PASCAL_HEAD_N");
+        const int64_t n_max = env_n != nullptr && atoll(env_n) > 0 ? (int64_t) atoll(env_n) : n_vocab;
+
+        FILE * file = fopen(path, "r");
+        if (file == nullptr) {
+            GGML_LOG_WARN("%s: cannot open '%s', the MTP head computes all tokens\n", __func__, path);
+            return nullptr;
+        }
+        std::vector<int32_t> rows;
+        std::vector<char>    seen(n_vocab, 0);
+        long long id = 0;
+        while ((int64_t) rows.size() < n_max && fscanf(file, "%lld", &id) == 1) {
+            if (id < 0 || id >= (long long) n_vocab || seen[id]) {
+                continue;
+            }
+            seen[id] = 1;
+            rows.push_back((int32_t) id);
+        }
+        fclose(file);
+
+        if (rows.size() < 1024 || (int64_t) rows.size() * 2 > n_vocab) {
+            GGML_LOG_WARN("%s: %zu usable token ids in '%s' (need 1024 ... n_vocab/2), the MTP head computes all tokens\n",
+                    __func__, rows.size(), path);
+            return nullptr;
+        }
+        if (rows.size() % 2 != 0) {
+            rows.push_back(rows.back()); // the kernel computes two rows per block
+        }
+
+        CUDA_CHECK(cudaMalloc(&list.rows, rows.size() * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemcpy(list.rows, rows.data(), rows.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+        list.n = (int) rows.size();
+        GGML_LOG_INFO("%s: the MTP head computes %d of %lld tokens (%s)\n", __func__, list.n, (long long) n_vocab, path);
+    }
+
+    if (list.rows == nullptr || list.n_vocab != n_vocab) {
+        return nullptr;
+    }
+    return &list;
+}
+
+static __global__ void mul_mat_vec_q_rowlist_fill(float * dst, const float value, const int n) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = value;
+    }
+}
+
+// Grid: n/2 blocks, block: one warp that computes two rows of the list and writes them to their own position in dst.
+template <ggml_type type>
+__launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_rowlist(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * rows_ptr, float * dst_ptr,
+        const uint32_t ncols_x, const uint32_t stride_row_x) {
+    const void    * GGML_CUDA_RESTRICT vx   = vx_ptr;
+    const void    * GGML_CUDA_RESTRICT vy   = vy_ptr;
+    const int32_t * GGML_CUDA_RESTRICT rows = rows_ptr;
+    float         * GGML_CUDA_RESTRICT dst  = dst_ptr;
+
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const int row_a = rows[2*blockIdx.x + 0];
+    const int row_b = rows[2*blockIdx.x + 1];
+
+    const int     blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter  = vdr * warp_size / qi;
+
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    const int kbx_offset_a = row_a*stride_row_x;
+    const int kbx_offset_b = row_b*stride_row_x;
+
+    float tmp_a = 0.0f;
+    float tmp_b = 0.0f;
+
+    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+
+        // x block quant index when casting the quants to int
+        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+
+        tmp_a += vec_dot_q_cuda(vx, &y[kby], kbx_offset_a + kbx, kqs);
+        tmp_b += vec_dot_q_cuda(vx, &y[kby], kbx_offset_b + kbx, kqs);
+    }
+
+    tmp_a = warp_reduce_sum<warp_size>(tmp_a);
+    tmp_b = warp_reduce_sum<warp_size>(tmp_b);
+
+    if (threadIdx.x == 0) {
+        dst[row_a] = tmp_a;
+        dst[row_b] = tmp_b;
+    }
+}
+
+template <ggml_type type>
+static void mul_mat_vec_q_rowlist_launch(
+        const void * vx, const void * vy, const int32_t * rows, float * dst,
+        const uint32_t ncols_x, const uint32_t stride_row_x, const int n_rows, const int warp_size, cudaStream_t stream) {
+    const dim3 block_nums(n_rows / 2, 1, 1);
+    const dim3 block_dims(warp_size, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+    ggml_cuda_kernel_launch(mul_mat_vec_q_rowlist<type>, launch_params, vx, vy, rows, dst, ncols_x, stride_row_x);
+}
+
+// Returns true if the restricted head was computed, false if the caller has to compute the full MUL_MAT.
+static bool ggml_cuda_pascal_rowlist_try(
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const void * vy, cudaStream_t stream) {
+    if (src0->name[0] != 'p' || strcmp(src0->name, GGML_CUDA_PASCAL_HEAD_NAME) != 0) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || ggml_nelements(src1) != src1->ne[0] || ggml_nelements(dst) != dst->ne[0] ||
+            dst->ne[0] != src0->ne[1] || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int device    = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    if (warp_size != 32) {
+        return false;
+    }
+
+    switch (src0->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            break;
+        default:
+            return false;
+    }
+
+    const int64_t n_vocab = src0->ne[1];
+    const ggml_cuda_pascal_rowlist * list = ggml_cuda_pascal_rowlist_get(device, n_vocab);
+    if (list == nullptr) {
+        return false;
+    }
+
+    float * dst_d = (float *) dst->data;
+    {
+        const dim3 block_nums((n_vocab + 255) / 256, 1, 1);
+        const dim3 block_dims(256, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+        const float value = -INFINITY;
+        const int   n     = (int) n_vocab;
+        ggml_cuda_kernel_launch(mul_mat_vec_q_rowlist_fill, launch_params, dst_d, value, n);
+    }
+
+    const uint32_t ncols_x      = src0->ne[0];
+    const uint32_t stride_row_x = src0->nb[1] / ggml_type_size(src0->type);
+
+#define MMVQ_ROWLIST_CASE(TYPE)                                                                                         \
+        case TYPE:                                                                                                      \
+            mul_mat_vec_q_rowlist_launch<TYPE>(src0->data, vy, list->rows, dst_d, ncols_x, stride_row_x, list->n,     \
+                                               warp_size, stream);                                                      \
+            break;
+
+    switch (src0->type) {
+        MMVQ_ROWLIST_CASE(GGML_TYPE_Q4_0)
+        MMVQ_ROWLIST_CASE(GGML_TYPE_Q4_1)
+        MMVQ_ROWLIST_CASE(GGML_TYPE_Q5_0)
+        MMVQ_ROWLIST_CASE(GGML_TYPE_Q5_1)
+        MMVQ_ROWLIST_CASE(GGML_TYPE_Q8_0)
+        MMVQ_ROWLIST_CASE(GGML_TYPE_Q4_K)
+        MMVQ_ROWLIST_CASE(GGML_TYPE_Q5_K)
+        MMVQ_ROWLIST_CASE(GGML_TYPE_Q6_K)
+        default:
+            GGML_ABORT("fatal error");
+    }
+#undef MMVQ_ROWLIST_CASE
+
+    return true;
+}
+// ---------------------------------------------------------------------------------------------------------
+
 // [pascal fork] size of the persistent q8_1 buffer, larger inputs are quantized into the pool as before
 #define GGML_CUDA_PASCAL_Q8_CACHE_BYTES (2*1024*1024)
 
@@ -1925,6 +2144,11 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
         quantize_row_q8_1_cuda(src1_d, src1_q8_1, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+    }
+
+    // [pascal fork] output head of the MTP draft restricted to a list of tokens
+    if (ids == nullptr && fusion == nullptr && ggml_cuda_pascal_rowlist_try(src0, src1, dst, src1_q8_1, stream)) {
+        return;
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

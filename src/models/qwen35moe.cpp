@@ -1,6 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -706,6 +708,18 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
+
+    // [pascal fork] with GGML_CUDA_PASCAL_HEAD_TOKENS the CUDA backend computes the draft logits of a list of tokens only
+    // (see ggml_cuda_pascal_rowlist_try). The weight is passed as a named view so that only this MUL_MAT is concerned,
+    // every other backend ignores the name and computes all the logits.
+    static const bool head_tokens = [] {
+        const char * env = getenv("GGML_CUDA_PASCAL_HEAD_TOKENS");
+        return env != nullptr && env[0] != '\0';
+    }();
+    if (head_tokens && cur->ne[1] == 1 && ggml_is_matrix(head_w)) {
+        head_w = ggml_view_2d(ctx0, head_w, head_w->ne[0], head_w->ne[1], head_w->nb[1], 0);
+        ggml_set_name(head_w, "pascal.mtp_head");
+    }
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
 
