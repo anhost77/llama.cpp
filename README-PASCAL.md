@@ -17,6 +17,9 @@ Base: upstream `aa75ff3` (2026-11-10).
 3. MTP draft head restricted to a token list: the draft output head (248k tokens on Qwen3.6) only computes the token ids listed in a file. The main model still verifies every draft over the full vocabulary, so the generated text is unchanged; only drafts outside the list are lost. A French list built from public-domain novels (Project Gutenberg) is provided in [pascal/tokens-fr.txt](pascal/tokens-fr.txt) (18k ids). Lists that are too short (8k) are slower.
 4. `GGML_CUDA_PROFILE=1`: time per node type, printed at exit.
 5. Small-kernel fusions in the gated delta net (Qwen3.5/3.6 linear-attention layers): one L2 norm for q and k (`LLAMA_PASCAL_GDN_QK_NORM`, bit-identical) and the alpha/beta gates in one kernel (`GGML_CUDA_PASCAL_FUSE_GDN_GATES`). 1186 -> 1036 nodes per token, about +2% generation, perplexity unchanged. `GGML_CUDA_PASCAL_DUMP_GRAPH=N` dumps the ordered node list.
+6. The delta-net kernel reads its recurrent state in place from the cache instead of a copied view (`GGML_CUDA_PASCAL_GDN_DIRECT_STATE`, bit-identical, ~126 MB less memory traffic per token), and the shared-expert gate plus the final additions of the MoE block run as one kernel (`GGML_CUDA_PASCAL_FUSE_SHEXP_GATE`). 1036 -> 886 nodes per token, tg +5.8%, real fact-checking workload with MTP +5.2% (101 -> 106.5 t/s), perplexity unchanged.
+
+A persistent "megakernel" was evaluated with a standalone micro-benchmark ([pascal/bulles.cu](pascal/bulles.cu), [results](pascal/results-06-megakernel-bench.md)): on a P40 a small kernel costs about 4 us whether launched serially or behind a grid barrier, and the best persistent variant gained only 2-3%, so it was not pursued.
 
 Runtime switches:
 
