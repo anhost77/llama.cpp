@@ -437,8 +437,29 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    // [pascal fork] q and k are adjacent slices of the convolution output with the same head size: normalize them with a
+    // single node and split the result (same values, one kernel less per layer). LLAMA_PASCAL_GDN_QK_NORM=0 disables it.
+    static const bool merge_qk_norm = [] {
+        const char * env = getenv("LLAMA_PASCAL_GDN_QK_NORM");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (merge_qk_norm && cparams.fused_gdn_ar && cparams.fused_gdn_ch) {
+        ggml_tensor * qk_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(conv_qkv_mix->type, head_k_dim),
+                nb1_qkv,
+                nb1_qkv * n_seq_tokens,
+                0);
+        qk_conv = build_gdn_l2_norm(ctx0, qk_conv, eps_norm); // [head_k_dim, 2 * num_k_heads, n_seq_tokens, n_seqs]
+        cb(qk_conv, "qk_conv_normed", il);
+
+        q_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], 0);
+        k_conv = ggml_view_4d(ctx0, qk_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+                qk_conv->nb[1], qk_conv->nb[2], qk_conv->nb[3], qk_conv->nb[1] * num_k_heads);
+    } else {
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    }
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);

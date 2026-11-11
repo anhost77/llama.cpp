@@ -4290,6 +4290,209 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// ---------------------------------------------------------------------------------------------------------
+// [pascal fork] Gates of the gated delta net for a few tokens (generation, speculative verification), in one kernel instead of five:
+//     g    = softplus(W_alpha * x + dt) * a
+//     beta = sigmoid(W_beta * x)
+// Matches MUL_MAT, RESHAPE, ADD, UNARY(softplus), MUL, RESHAPE, MUL_MAT, RESHAPE, UNARY(sigmoid) with F32 weights.
+// GGML_CUDA_PASCAL_FUSE_GDN_GATES=0 disables it.
+
+static bool ggml_cuda_pascal_gdn_gates_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_PASCAL_FUSE_GDN_GATES");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Grid: (2 * n_heads, n_tokens) blocks of one warp, block (h, t) computes row h of W_alpha for token t,
+// block (n_heads + h, t) row h of W_beta.
+static __global__ void ggml_cuda_pascal_gdn_gates_kernel(
+        const float * w_alpha, const float * w_beta, const float * x_all, const float * dt, const float * a,
+        float * dst_g_all, float * dst_beta_all, const int n_embd, const int n_heads) {
+    const int  row     = blockIdx.x;
+    const bool is_beta = row >= n_heads;
+    const int  h       = is_beta ? row - n_heads : row;
+
+    const float * w        = (is_beta ? w_beta : w_alpha) + (int64_t) h * n_embd;
+    const float * x        = x_all        + (int64_t) blockIdx.y * n_embd;
+    float *       dst_g    = dst_g_all    + (int64_t) blockIdx.y * n_heads;
+    float *       dst_beta = dst_beta_all + (int64_t) blockIdx.y * n_heads;
+
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n_embd; i += 32) {
+        sum += w[i] * x[i];
+    }
+    sum = warp_reduce_sum<32>(sum);
+
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    if (is_beta) {
+        dst_beta[h] = 1.0f / (1.0f + expf(-sum));
+    } else {
+        const float v = sum + dt[h];
+        dst_g[h] = ((v > 20.0f) ? v : log1pf(expf(v))) * a[h];
+    }
+}
+
+static const int GGML_CUDA_PASCAL_GDN_GATES_NODES = 9;
+
+static bool ggml_cuda_pascal_match_gdn_gates(const ggml_cgraph * cgraph, const int i) {
+    static const enum ggml_op ops[GGML_CUDA_PASCAL_GDN_GATES_NODES] = {
+        GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE,
+        GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY,
+    };
+    if (i + GGML_CUDA_PASCAL_GDN_GATES_NODES > cgraph->n_nodes) {
+        return false;
+    }
+    for (int k = 0; k < GGML_CUDA_PASCAL_GDN_GATES_NODES; ++k) {
+        if (cgraph->nodes[i + k]->op != ops[k] || cgraph->nodes[i + k]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * mm_a = cgraph->nodes[i + 0];
+    const ggml_tensor * rs_a = cgraph->nodes[i + 1];
+    const ggml_tensor * add  = cgraph->nodes[i + 2];
+    const ggml_tensor * sp   = cgraph->nodes[i + 3];
+    const ggml_tensor * mul  = cgraph->nodes[i + 4];
+    const ggml_tensor * rs_g = cgraph->nodes[i + 5];
+    const ggml_tensor * mm_b = cgraph->nodes[i + 6];
+    const ggml_tensor * rs_b = cgraph->nodes[i + 7];
+    const ggml_tensor * sg   = cgraph->nodes[i + 8];
+
+    if (rs_a->src[0] != mm_a || sp->src[0] != add || rs_g->src[0] != mul || rs_b->src[0] != mm_b || sg->src[0] != rs_b) {
+        return false;
+    }
+    if (ggml_get_unary_op(sp) != GGML_UNARY_OP_SOFTPLUS || ggml_get_unary_op(sg) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+
+    const ggml_tensor * dt = add->src[0] == rs_a ? add->src[1] : (add->src[1] == rs_a ? add->src[0] : nullptr);
+    const ggml_tensor * a  = mul->src[0] == sp   ? mul->src[1] : (mul->src[1] == sp   ? mul->src[0] : nullptr);
+    if (dt == nullptr || a == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * w_a = mm_a->src[0];
+    const ggml_tensor * w_b = mm_b->src[0];
+    const ggml_tensor * x   = mm_a->src[1];
+    if (w_a == nullptr || w_b == nullptr || x == nullptr || mm_b->src[1] != x) {
+        return false;
+    }
+
+    const int64_t n_embd  = w_a->ne[0];
+    const int64_t n_heads = w_a->ne[1];
+    if (w_a->type != GGML_TYPE_F32 || w_b->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+            dt->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(w_a) || !ggml_is_contiguous(w_b) || !ggml_is_contiguous(x) ||
+            !ggml_is_contiguous(dt) || !ggml_is_contiguous(a) || !ggml_is_contiguous(mul) || !ggml_is_contiguous(sg)) {
+        return false;
+    }
+    if (w_a->ne[2] != 1 || w_a->ne[3] != 1 || !ggml_are_same_shape(w_a, w_b) || n_embd > INT32_MAX || n_heads < 1 || n_heads > 4096) {
+        return false;
+    }
+    // a few tokens: x holds n_tokens columns, the outputs n_heads values per token, dt and a are broadcast over the tokens
+    if (x->ne[0] != n_embd || ggml_nelements(x) % n_embd != 0) {
+        return false;
+    }
+    const int64_t n_tokens = ggml_nelements(x) / n_embd;
+    if (n_tokens < 1 || n_tokens > 64) {
+        return false;
+    }
+    if (ggml_nelements(mm_a) != n_heads * n_tokens || ggml_nelements(mm_b) != n_heads * n_tokens ||
+            ggml_nelements(dt) != n_heads || ggml_nelements(a) != n_heads ||
+            ggml_nelements(add) != n_heads * n_tokens || ggml_nelements(mul) != n_heads * n_tokens ||
+            ggml_nelements(sg) != n_heads * n_tokens ||
+            mm_a->ne[0] != n_heads || mm_b->ne[0] != n_heads || add->ne[0] != n_heads || mul->ne[0] != n_heads) {
+        return false;
+    }
+
+    const int outputs[2] = { i + 5, i + 8 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, GGML_CUDA_PASCAL_GDN_GATES_NODES, ops, outputs, 2)) {
+        return false;
+    }
+    return ggml_cuda_check_fusion_memory_ranges(cgraph, i, GGML_CUDA_PASCAL_GDN_GATES_NODES, outputs, 2);
+}
+
+static void ggml_cuda_pascal_gdn_gates(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * mm_a = cgraph->nodes[i + 0];
+    const ggml_tensor * rs_a = cgraph->nodes[i + 1];
+    const ggml_tensor * add  = cgraph->nodes[i + 2];
+    const ggml_tensor * sp   = cgraph->nodes[i + 3];
+    const ggml_tensor * mul  = cgraph->nodes[i + 4];
+    const ggml_tensor * mm_b = cgraph->nodes[i + 6];
+    const ggml_tensor * sg   = cgraph->nodes[i + 8];
+
+    const ggml_tensor * dt = add->src[0] == rs_a ? add->src[1] : add->src[0];
+    const ggml_tensor * a  = mul->src[0] == sp   ? mul->src[1] : mul->src[0];
+
+    const float * w_alpha  = (const float *) mm_a->src[0]->data;
+    const float * w_beta   = (const float *) mm_b->src[0]->data;
+    const float * x_d      = (const float *) mm_a->src[1]->data;
+    const float * dt_d     = (const float *) dt->data;
+    const float * a_d      = (const float *) a->data;
+    float *       dst_g    = (float *) mul->data;
+    float *       dst_beta = (float *) sg->data;
+    const int     n_embd   = (int) mm_a->src[0]->ne[0];
+    const int     n_heads  = (int) mm_a->src[0]->ne[1];
+
+    const int     n_tokens = (int) (ggml_nelements(mm_a->src[1]) / n_embd);
+
+    const dim3 block_nums(2 * n_heads, n_tokens, 1);
+    const dim3 block_dims(32, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, ctx.stream());
+    ggml_cuda_kernel_launch(ggml_cuda_pascal_gdn_gates_kernel, launch_params,
+        w_alpha, w_beta, x_d, dt_d, a_d, dst_g, dst_beta, n_embd, n_heads);
+}
+
+// [pascal fork] GGML_CUDA_PASCAL_DUMP_GRAPH=N writes the node list of the N-th evaluated graph with at least 200 nodes to
+// GGML_CUDA_PASCAL_DUMP_FILE (default /tmp/ggml-cuda-graph.txt): the order of the nodes decides which chains can be fused.
+static void ggml_cuda_pascal_dump_graph(const ggml_cgraph * cgraph) {
+    static const int target = ggml_cuda_env_int("GGML_CUDA_PASCAL_DUMP_GRAPH", 0);
+    static int       n_seen = 0;
+    if (target <= 0 || cgraph->n_nodes < 200 || ++n_seen != target) {
+        return;
+    }
+    const char * path = getenv("GGML_CUDA_PASCAL_DUMP_FILE");
+    FILE * file = fopen(path != nullptr && path[0] != '\0' ? path : "/tmp/ggml-cuda-graph.txt", "w");
+    if (file == nullptr) {
+        return;
+    }
+    std::map<const ggml_tensor *, int> index;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        index[cgraph->nodes[i]] = i;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        fprintf(file, "%5d %-18s %-6s [%lld,%lld,%lld,%lld] %s%s '%s' <-", i,
+                node->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(node)) : ggml_op_name(node->op),
+                ggml_type_name(node->type),
+                (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3],
+                node->view_src != nullptr ? "view " : "", (node->flags & GGML_TENSOR_FLAG_COMPUTE) ? "" : "nocompute", node->name);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * src = node->src[j];
+            if (src == nullptr) {
+                continue;
+            }
+            const auto it = index.find(src);
+            if (it != index.end()) {
+                fprintf(file, " #%d", it->second);
+            } else {
+                fprintf(file, " leaf(%s %s [%lld,%lld,%lld,%lld])", src->name, ggml_type_name(src->type),
+                        (long long) src->ne[0], (long long) src->ne[1], (long long) src->ne[2], (long long) src->ne[3]);
+            }
+        }
+        fprintf(file, "\n");
+    }
+    fclose(file);
+}
+// ---------------------------------------------------------------------------------------------------------
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4297,6 +4500,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // [pascal fork] gates of the gated delta net
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_pascal_gdn_gates_enabled() &&
+            cuda_ctx->stream_context().concurrent_events.empty() && ggml_cuda_pascal_match_gdn_gates(cgraph, i)) {
+        ggml_cuda_pascal_gdn_gates(*cuda_ctx, cgraph, i);
+        return GGML_CUDA_PASCAL_GDN_GATES_NODES - 1;
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
@@ -5368,6 +5578,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (ggml_cuda_profile_enabled()) {
         g_ggml_cuda_profile_graphs++;
     }
+
+    ggml_cuda_pascal_dump_graph(cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
